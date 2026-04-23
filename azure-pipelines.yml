@@ -1,0 +1,104 @@
+trigger:
+  branches:
+    include:
+      - master
+
+variables:
+  acrLoginServer: 'sabaflaskrireg.azurecr.io'
+  imageName: 'simple-flask-app'
+  imageTag: '$(Build.BuildId)'
+  resourceGroup: 'flask-rds-rg'
+  containerName: 'flask-app-container'
+
+stages:
+
+# ── Stage 1: Build and push Docker image ──────────────────
+- stage: Build
+  displayName: 'Build and push to ACR'
+  jobs:
+  - job: BuildAndPush
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - task: Docker@2
+      displayName: 'Build Docker image'
+      inputs:
+        command: build
+        repository: '$(acrLoginServer)/$(imageName)'
+        dockerfile: 'Dockerfile'
+        tags: |
+          $(imageTag)
+          latest
+
+    - task: Docker@2
+      displayName: 'Push image to ACR'
+      inputs:
+        command: push
+        containerRegistry: 'MyACRConnection'
+        repository: '$(imageName)'
+        tags: |
+          $(imageTag)
+          latest
+
+# ── Stage 2: Deploy to Azure Container Instances ──────────
+- stage: Deploy
+  displayName: 'Deploy container'
+  dependsOn: Build
+  jobs:
+  - job: DeployACI
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - task: AzureCLI@2
+      displayName: 'Deploy to Azure Container Instances'
+      inputs:
+        azureSubscription: 'MyAzureConnection'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az container create \
+            --resource-group $(resourceGroup) \
+            --name $(containerName) \
+            --image $(acrLoginServer)/$(imageName):$(imageTag) \
+            --registry-login-server $(acrLoginServer) \
+            --registry-username $(ACR_USER) \
+            --registry-password $(ACR_PASS) \
+            --ports 5000 \
+            --dns-name-label sabaflaskie \
+            --restart-policy Always \
+            --environment-variables \
+              FLASK_ENV=production
+
+    - task: AzureCLI@2
+      displayName: 'Validate and print app URL'
+      inputs:
+        azureSubscription: 'MyAzureConnection'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          echo "Waiting for container to start..."
+          sleep 20
+
+          STATUS=$(az container show \
+            --resource-group $(resourceGroup) \
+            --name $(containerName) \
+            --query instanceView.state -o tsv)
+
+          echo "Container status: $STATUS"
+
+          URL=$(az container show \
+            --resource-group $(resourceGroup) \
+            --name $(containerName) \
+            --query ipAddress.fqdn -o tsv)
+
+          echo "Your app is live at: http://$URL:3000"
+
+          if [[ "$STATUS" != "Running" ]]; then
+            echo "Deployment failed!"
+            az container logs \
+              --resource-group $(resourceGroup) \
+              --name $(containerName)
+            exit 1
+          fi
